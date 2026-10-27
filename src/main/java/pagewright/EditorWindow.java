@@ -11,6 +11,7 @@ import javax.swing.ImageIcon;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JColorChooser;
+import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
@@ -100,6 +101,12 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
     private final JTextField findField = new JTextField(16);
     private final JTextField replaceField = new JTextField(16);
     private final JCheckBox allPages = new JCheckBox("All pages");
+    private final JSpinner fmtSize = new JSpinner(new SpinnerNumberModel(0, 0, 200, 1));
+    private final JComboBox<String> fmtWeight = new JComboBox<>(new String[] {"Same weight", "Bold", "Regular"});
+    private final JComboBox<String> fmtAlign = new JComboBox<>(new String[] {"Auto align", "Left", "Right"});
+    private final JCheckBox fmtMovable = new JCheckBox("Movable item (Arial)");
+    private Color fmtColor;
+    private final JLabel fmtColorSwatch = new JLabel("      ");
     private final UndoManager findUndo = new UndoManager();
     private final UndoManager replaceUndo = new UndoManager();
 
@@ -116,6 +123,9 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
     private Point pressPoint;
     private TextEditor.Hit pressHit;
     private boolean dragging;
+    /** True while the highlighted selection itself is being dragged to a new place. */
+    private boolean grabbing;
+    private Rectangle grabbedFrom;
 
     public EditorWindow() {
         super(App.NAME);
@@ -241,7 +251,14 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
                         + "drag = any part of a line, shift+click = whole line</small></html>")),
                 row(new JLabel("Find   "), findField),
                 row(new JLabel("Replace"), replaceField),
-                row(allPages, button("Replace text", this::replaceText))));
+                row(new JLabel("<html><small>Format (defaults match the original)</small></html>")),
+                row(fmtWeight, fmtMovable),
+                row(new JLabel("Size"), fmtSize, new JLabel("<html><small>0 = same</small></html>"), fmtAlign),
+                row(button("Color...", this::pickReplaceColor), button("Same color", () -> setReplaceColor(null)),
+                        fmtColorSwatch),
+                row(allPages, button("Replace text", () -> replaceText(Edit.REPLACE))),
+                row(button("Move text", () -> replaceText(Edit.MOVE)),
+                        button("Remove text", () -> replaceText(Edit.REMOVE)))));
 
         side.add(section("Insert (then drag it into place)",
                 row(button("Text", this::insertText), button("Image...", this::insertImage)),
@@ -260,7 +277,10 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
 
         side.add(section("Page",
                 row(button("Rotate left", () -> rotate(270)), button("Rotate right", () -> rotate(90))),
-                row(button("Delete page", this::deleteCurrentPage))));
+                row(button("Delete page", this::deleteCurrentPage)),
+                row(new JLabel("<html><small>Erase a section: place the box over it,<br>"
+                        + "resize it, then apply</small></html>")),
+                row(button("Erase area...", this::insertEraseBox), button("Apply erase", this::applyErase))));
         side.add(section("Whole document",
                 row(button("Merge another PDF...", this::mergeAnother)),
                 row(button("Split into pages...", this::splitPages)),
@@ -406,6 +426,12 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
     @Override
     public void selectionChanged(Annotation selected) {
         syncProps();
+        if (selected != null && selected.type == Annotation.Type.TEXT && !selected.text.contains("\n")) {
+            findField.setText(selected.text);
+            replaceField.setText(selected.text);
+            status.setText("Item selected: drag it to move, edit it in the Selected item box, "
+                    + "or use Replace text / Remove text on it");
+        }
     }
 
     private void editSelected(String key, Consumer<Annotation> change) {
@@ -499,6 +525,37 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
             preview.requestFocusInWindow();
         }
         status.setText("Added - drag it into place. Delete key removes it.");
+    }
+
+    private void insertEraseBox() {
+        if (ready()) {
+            float[] s = spotInView();
+            Annotation box = Annotation.rect(page, s[0], s[1], 250, 120);
+            box.color = Color.RED;
+            insert(box);
+            status.setText("Drag and resize the red box over the section, then click Apply erase");
+        }
+    }
+
+    private void applyErase() {
+        Annotation box = preview.getSelected();
+        if (!ready()) {
+            return;
+        }
+        if (box == null || box.type != Annotation.Type.RECT || box.filled) {
+            status.setText("Click Erase area..., place the red box over the section, keep it selected, then Apply erase");
+            return;
+        }
+        java.awt.geom.Rectangle2D.Float region = box.bounds();
+        int target = box.page;
+        session.beginChange(null);
+        session.annotations.remove(box);
+        preview.select(null);
+        int[] deleted = new int[1];
+        applyIf("Erase area",
+                (in, out) -> deleted[0] = PageEraser.erase(in, out, target, region) + 1,
+                () -> deleted[0] > 0,
+                () -> "Section erased (not saved yet: Save or Save As)");
     }
 
     private void insertText() {
@@ -1021,9 +1078,16 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
     @Override
     public void backgroundPressed(Point p) {
         dragging = false;
+        grabbing = false;
         pressPoint = p;
         pressHit = null;
         if (doc == null) {
+            return;
+        }
+        Rectangle selection = preview.getHighlight();
+        if (selection != null && selection.contains(p) && !findField.getText().isEmpty()) {
+            grabbing = true;
+            grabbedFrom = selection;
             return;
         }
         try {
@@ -1035,6 +1099,14 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
 
     @Override
     public void backgroundDragged(Point p) {
+        if (grabbing) {
+            if (pressPoint.distance(p) >= 4) {
+                dragging = true;
+                preview.setHighlight(new Rectangle(grabbedFrom.x + p.x - pressPoint.x,
+                        grabbedFrom.y + p.y - pressPoint.y, grabbedFrom.width, grabbedFrom.height));
+            }
+            return;
+        }
         if (pressHit == null || (!dragging && pressPoint.distance(p) < 4)) {
             return;
         }
@@ -1045,6 +1117,15 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
 
     @Override
     public void backgroundReleased(MouseEvent e) {
+        if (grabbing) {
+            grabbing = false;
+            if (dragging) {
+                dragging = false;
+                preview.setHighlight(grabbedFrom);
+                replaceText(Edit.MOVE, (e.getX() - pressPoint.x) / scale, (e.getY() - pressPoint.y) / scale);
+                return;
+            }
+        }
         if (dragging && pressHit != null) {
             int[] range = dragRange(e.getPoint());
             showSelection(pressHit.line, range[0], range[1], true);
@@ -1086,13 +1167,43 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
             replaceField.setText(findField.getText());
             replaceField.requestFocusInWindow();
             replaceField.selectAll();
-            status.setText("Selected: " + findField.getText());
+            status.setText("Selected: " + findField.getText() + "  (drag the highlight to move it)");
         }
     }
 
-    private void replaceText() {
+    private void pickReplaceColor() {
+        Color c = JColorChooser.showDialog(this, "Replacement text color", fmtColor == null ? Color.BLACK : fmtColor);
+        if (c != null) {
+            setReplaceColor(c);
+        }
+    }
+
+    private void setReplaceColor(Color c) {
+        fmtColor = c;
+        fmtColorSwatch.setOpaque(c != null);
+        fmtColorSwatch.setBackground(c);
+        fmtColorSwatch.repaint();
+    }
+
+    private TextEditor.Style replaceStyle() {
+        TextEditor.Style st = new TextEditor.Style();
+        st.size = ((Number) fmtSize.getValue()).floatValue();
+        st.bold = fmtWeight.getSelectedIndex() == 0 ? null : fmtWeight.getSelectedIndex() == 1;
+        st.color = fmtColor;
+        st.movable = fmtMovable.isSelected();
+        st.align = fmtAlign.getSelectedIndex() == 1 ? "left" : fmtAlign.getSelectedIndex() == 2 ? "right" : "auto";
+        return st;
+    }
+
+    private enum Edit { REPLACE, MOVE, REMOVE }
+
+    private void replaceText(Edit edit) {
+        replaceText(edit, 0, 0);
+    }
+
+    private void replaceText(Edit edit, float dx, float dy) {
         String find = findField.getText();
-        String repl = replaceField.getText();
+        String repl = edit == Edit.REMOVE ? "" : edit == Edit.MOVE ? find : replaceField.getText();
         if (find.isEmpty()) {
             status.setText("Click a word on the page (or type text) in Find first");
             return;
@@ -1107,10 +1218,23 @@ public class EditorWindow extends JFrame implements PreviewPanel.Listener {
             }
         }
         TextEditor.Result[] result = new TextEditor.Result[1];
-        applyIf("Replace text",
-                (in, out) -> result[0] = TextEditor.replace(in, out, pages, find, repl),
+        TextEditor.Style style = replaceStyle();
+        style.movable |= edit == Edit.MOVE;
+        applyIf(edit == Edit.REMOVE ? "Remove text" : edit == Edit.MOVE ? "Move text" : "Replace text",
+                (in, out) -> result[0] = TextEditor.replace(in, out, pages, find, repl, style),
                 () -> result[0].inPlace + result[0].coveredAndOverwritten > 0,
-                () -> result[0].describe() + "  (not saved yet: Save or Save As)");
+                () -> {
+                    for (Annotation moved : result[0].items) {
+                        moved.x += dx;
+                        moved.y += dy;
+                    }
+                    session.annotations.addAll(result[0].items);
+                    refreshView();
+                    if (!result[0].items.isEmpty()) {
+                        preview.select(result[0].items.get(0));
+                    }
+                    return result[0].describe() + " - drag to reposition (not saved yet: Save or Save As)";
+                });
     }
 
     private void error(Throwable t) {

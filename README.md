@@ -3,7 +3,10 @@
 A small desktop PDF editor for macOS, Windows and Linux, built with Java Swing and Apache PDFBox.
 
 - Open a PDF, preview it, zoom and page through it
-- **Edit existing text**: click a word (double-click = sentence, drag = any part of a line) and replace it
+- **Edit existing text**: click a word (double-click = sentence, drag = any part of a line), then replace it,
+  remove it, or drag the highlight to move it. Replacements keep the original size, weight and background/text
+  colour, and can be restyled (size, weight, colour, alignment)
+- **Erase a section**: place a box over any area (a table, a summary block) and apply to remove it
 - **Insert** text, images, lines and rectangles; drag to move, handles to resize, Delete key to remove
 - Rotate or delete pages, merge PDFs, split into one file per page, extract text
 - Full undo / redo, and your original file is never changed unless you choose to overwrite it
@@ -66,9 +69,11 @@ packaging/make-launcher.sh      # rebuilds the "Start Pagewright" launcher from 
 - Inserted items stay editable until you save, or until you run a page-changing action (rotate, delete page,
   merge, replace text), which draws them into the PDF first. Undo still works across that.
 - Inserted text uses the built-in Helvetica font, so Latin characters only (no rupee sign or non-Latin scripts yet).
-- Text replacement edits the PDF text directly when the font allows it. For subset fonts it covers the old text
-  with a white box and writes the new text on top. **That is not secure redaction**: the original text remains
-  in the file.
+- Replacement text is drawn in the page's own font when that font has the needed letters, so numbers match
+  exactly. Otherwise (or when you tick "Movable item"), it becomes an Arial item you can drag until the next
+  operation. The old text is deleted from the file, glyph by glyph, not just covered.
+- Erase deletes the text inside the box and paints the area in the surrounding background colour. Shapes and
+  images inside are covered, not removed from the file, so do not rely on it for secure redaction of images.
 - Scanned pages (images of text) cannot be edited as text.
 - Items can't be added to a rotated page yet.
 

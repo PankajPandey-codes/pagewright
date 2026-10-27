@@ -12,17 +12,22 @@ import org.apache.pdfbox.pdfwriter.ContentStreamWriter;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.contentstream.PDContentStream;
+import org.apache.pdfbox.pdmodel.graphics.PDXObject;
+import org.apache.pdfbox.pdmodel.graphics.form.PDFormXObject;
 import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.font.PDFont;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.Color;
 import java.awt.geom.Rectangle2D;
+import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
@@ -41,14 +46,28 @@ public class TextEditor {
     private static final float WORD_GAP_KERN = 250f;
     private static final float LAYOUT_GAP_KERN = 1500f;
 
+    /** How replacement text is drawn when the original font cannot be reused; null fields mean "match the original". */
+    public static class Style {
+        public static final Style ORIGINAL = new Style();
+        public float size;
+        public Boolean bold;
+        public Color color;
+        /** "auto", "left" or "right": which edge of the old text stays put when the new text is a different width. */
+        public String align = "auto";
+        /** Draw the replacement as a movable Arial item instead of in the page's own font. */
+        public boolean movable;
+    }
+
     public static class Result {
         public int inPlace;
         public int coveredAndOverwritten;
         public int skipped;
+        /** Replacement text left as movable items for the caller to place on the document. */
+        public final List<Annotation> items = new ArrayList<>();
 
         public String describe() {
             return "Replaced " + inPlace + " in place, " + coveredAndOverwritten
-                    + " by covering the old text (original text still exists hidden underneath), "
+                    + " as movable text, "
                     + skipped + " not replaced";
         }
     }
@@ -58,11 +77,27 @@ public class TextEditor {
         public final String text;
         private final List<TextPosition> tps;
         private final List<Integer> tpOfChar;
+        /** For each text position: the operator it came from and its index within that operator. */
+        private final List<int[]> glyphs;
 
-        Line(String text, List<TextPosition> tps, List<Integer> tpOfChar) {
+        Line(String text, List<TextPosition> tps, List<Integer> tpOfChar, List<int[]> glyphs) {
             this.text = text;
             this.tps = tps;
             this.tpOfChar = tpOfChar;
+            this.glyphs = glyphs;
+        }
+
+        /** Adds the stream addresses of the glyphs (spaces drawn as glyphs included) of text[start, end) to out. */
+        void collectGlyphs(int start, int end, java.util.Set<Long> out) {
+            for (int i = start; i < end; i++) {
+                TextPosition tp = tps.get(tpOfChar.get(i));
+                boolean synthetic = Character.isWhitespace(text.charAt(i))
+                        && (tp.getUnicode() == null || !tp.getUnicode().isBlank());
+                if (!synthetic) {
+                    int[] g = glyphs.get(tpOfChar.get(i));
+                    out.add(GlyphStripper.key(g[0], g[1]));
+                }
+            }
         }
 
         /** Index of the character whose centre is nearest to x (points from the left). */
@@ -138,9 +173,21 @@ public class TextEditor {
 
     public static List<Line> lines(PDDocument doc, int pageIndex) throws IOException {
         List<List<TextPosition>> rows = new ArrayList<>();
+        java.util.Map<TextPosition, int[]> origin = new java.util.IdentityHashMap<>();
+        int[] counters = {-1, 0};
         PDFTextStripper stripper = new PDFTextStripper() {
             @Override
+            protected void processOperator(Operator operator, List<COSBase> operands) throws IOException {
+                if ("Tj".equals(operator.getName()) || "TJ".equals(operator.getName())) {
+                    counters[0]++;
+                    counters[1] = 0;
+                }
+                super.processOperator(operator, operands);
+            }
+
+            @Override
             protected void processTextPosition(TextPosition tp) {
+                origin.put(tp, new int[] {counters[0], counters[1]++});
                 for (List<TextPosition> row : rows) {
                     if (Math.abs(row.get(0).getYDirAdj() - tp.getYDirAdj()) <= 0.4f * tp.getFontSizeInPt()) {
                         row.add(tp);
@@ -164,7 +211,7 @@ public class TextEditor {
                 boolean columnBreak = k == row.size()
                         || horizontalGap(row.get(k - 1), row.get(k)) > COLUMN_GAP_EM * row.get(k).getFontSizeInPt();
                 if (columnBreak) {
-                    Line line = buildLine(row.subList(from, k));
+                    Line line = buildLine(row.subList(from, k), origin);
                     if (line != null) {
                         result.add(line);
                     }
@@ -179,7 +226,7 @@ public class TextEditor {
         return tp.getXDirAdj() - (prev.getXDirAdj() + prev.getWidthDirAdj());
     }
 
-    private static Line buildLine(List<TextPosition> segment) {
+    private static Line buildLine(List<TextPosition> segment, java.util.Map<TextPosition, int[]> origin) {
         List<TextPosition> row = new ArrayList<>(segment);
         StringBuilder sb = new StringBuilder();
         List<Integer> map = new ArrayList<>();
@@ -198,7 +245,11 @@ public class TextEditor {
             }
             prev = tp;
         }
-        return sb.length() > 0 ? new Line(sb.toString(), row, map) : null;
+        List<int[]> glyphs = new ArrayList<>();
+        for (TextPosition tp : row) {
+            glyphs.add(origin.get(tp));
+        }
+        return sb.length() > 0 ? new Line(sb.toString(), row, map, glyphs) : null;
     }
 
     /** Finds the character under a point given in points from the page's top-left. */
@@ -223,187 +274,254 @@ public class TextEditor {
 
     public static Result replace(File in, File out, List<Integer> pages, String find, String repl)
             throws IOException {
+        return replace(in, out, pages, find, repl, Style.ORIGINAL);
+    }
+
+    public static Result replace(File in, File out, List<Integer> pages, String find, String repl, Style style)
+            throws IOException {
         if (find.isEmpty()) {
             throw new IllegalArgumentException("Find text is empty");
         }
         Result result = new Result();
         try (PDDocument doc = Loader.loadPDF(in)) {
             for (int p : pages) {
-                PDPage page = doc.getPage(p);
-                int replaced = replaceInStream(doc, page, find, repl);
-                result.inPlace += replaced;
-                // When the replacement contains the search text, matches left after an in-place edit would be
-                // the new text itself, so only cover if nothing was replaced in place.
-                if (replaced == 0 || !repl.contains(find)) {
-                    coverRemaining(doc, p, find, repl, result);
-                }
+                coverRemaining(doc, p, find, repl, style, result);
             }
             doc.save(out);
         }
         return result;
     }
 
-    private static int replaceInStream(PDDocument doc, PDPage page, String find, String repl)
-            throws IOException {
-        PDResources res = page.getResources();
-        if (res == null) {
-            return 0;
-        }
-        List<Object> tokens = new PDFStreamParser(page).parse();
-        List<PDFont> savedFonts = new ArrayList<>();
-        PDFont font = null;
-        int count = 0;
-        for (int i = 0; i < tokens.size(); i++) {
-            if (!(tokens.get(i) instanceof Operator)) {
-                continue;
-            }
-            String op = ((Operator) tokens.get(i)).getName();
-            if ("q".equals(op)) {
-                savedFonts.add(font);
-                continue;
-            }
-            if ("Q".equals(op)) {
-                if (!savedFonts.isEmpty()) {
-                    font = savedFonts.remove(savedFonts.size() - 1);
-                }
-                continue;
-            }
-            if ("Tf".equals(op) && i >= 2 && tokens.get(i - 2) instanceof COSName) {
-                font = res.getFont((COSName) tokens.get(i - 2));
-                continue;
-            }
-            if (font == null || i < 1) {
-                continue;
-            }
-            Object arg = tokens.get(i - 1);
-            try {
-                if (("Tj".equals(op) || "'".equals(op) || "\"".equals(op)) && arg instanceof COSString) {
-                    String s = decode(font, ((COSString) arg).getBytes());
-                    int n = occurrences(s, find);
-                    if (n > 0) {
-                        tokens.set(i - 1, new COSString(font.encode(s.replace(find, repl))));
-                        count += n;
-                    }
-                } else if ("TJ".equals(op) && arg instanceof COSArray) {
-                    String s = joinTj((COSArray) arg, font);
-                    int n = s == null ? 0 : occurrences(s, find);
-                    if (n > 0) {
-                        COSArray replaced = new COSArray();
-                        replaced.add(new COSString(font.encode(s.replace(find, repl))));
-                        tokens.set(i - 1, replaced);
-                        count += n;
-                    }
-                }
-            } catch (IOException | RuntimeException e) {
-                // The font cannot decode this string or has no glyph for the new text (typical of subset
-                // fonts); coverRemaining() handles the leftover match and the result reports it.
-            }
-        }
-        if (count > 0) {
-            PDStream stream = new PDStream(doc);
-            try (OutputStream os = stream.createOutputStream(COSName.FLATE_DECODE)) {
-                new ContentStreamWriter(os).writeTokens(tokens);
-            }
-            page.setContents(stream);
-        }
-        return count;
+    /** One piece of text to take off the page and, if {@code text} is non-empty, put back as a movable item. */
+    private static final class Spot {
+        Rectangle2D.Float box;
+        float size;
+        boolean bold;
+        float x;
+        float baseline;
+        String text;
+        boolean right;
+        boolean fixedStyle;
+        PDFont font;
+        Spot tail;
+        Color[] colours;
+        Line line;
+        int from;
+        int to;
     }
 
-    /** Decodes a TJ array to text, turning word-sized kerning gaps into spaces; null if it uses layout gaps. */
-    private static String joinTj(COSArray array, PDFont font) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        for (COSBase b : array) {
-            if (b instanceof COSString) {
-                sb.append(decode(font, ((COSString) b).getBytes()));
-            } else if (b instanceof COSNumber) {
-                float kern = ((COSNumber) b).floatValue();
-                if (kern < -LAYOUT_GAP_KERN) {
-                    return null;
-                }
-                if (kern < -WORD_GAP_KERN && sb.length() > 0 && sb.charAt(sb.length() - 1) != ' ') {
-                    sb.append(' ');
-                }
-            }
-        }
-        return sb.toString();
-    }
-
-    private static void coverRemaining(PDDocument doc, int pageIndex, String find, String repl, Result result)
-            throws IOException {
+    private static void coverRemaining(PDDocument doc, int pageIndex, String find, String repl, Style style,
+            Result result) throws IOException {
         PDPage page = doc.getPage(pageIndex);
-        List<float[]> targets = new ArrayList<>();
-        List<Boolean> bold = new ArrayList<>();
-        List<Rectangle2D.Float> boxes = new ArrayList<>();
-        List<Float> sizes = new ArrayList<>();
-        for (Line line : lines(doc, pageIndex)) {
-            for (int at = line.text.indexOf(find); at >= 0; at = line.text.indexOf(find, at + find.length())) {
-                if (page.getRotation() != 0) {
+        float pageWidth = page.getCropBox().getWidth();
+        List<Line> pageLines = lines(doc, pageIndex);
+        if (page.getRotation() != 0) {
+            for (Line line : pageLines) {
+                for (int at = line.text.indexOf(find); at >= 0; at = line.text.indexOf(find, at + find.length())) {
                     result.skipped++;
-                    continue;
                 }
+            }
+            return;
+        }
+        if (!repl.isEmpty() && !UnicodeFonts.face(repl, false).missing(repl).isEmpty()) {
+            for (Line line : pageLines) {
+                for (int at = line.text.indexOf(find); at >= 0; at = line.text.indexOf(find, at + find.length())) {
+                    result.skipped++;
+                }
+            }
+            return;
+        }
+        List<Spot> spots = new ArrayList<>();
+        List<Spot> trailing = new ArrayList<>();
+        for (Line line : pageLines) {
+            for (int at = line.text.indexOf(find); at >= 0; at = line.text.indexOf(find, at + find.length())) {
                 TextPosition first = line.tps.get(line.tpOfChar.get(at));
-                boxes.add(line.box(at, at + find.length()));
-                sizes.add(first.getFontSizeInPt());
-                bold.add(first.getFont().getName() != null && first.getFont().getName().toLowerCase().contains("bold"));
-                targets.add(new float[] {first.getXDirAdj(), first.getYDirAdj()});
+                Spot sp = new Spot();
+                sp.box = line.box(at, at + find.length());
+                sp.size = first.getFontSizeInPt();
+                String fontName = first.getFont().getName() == null ? "" : first.getFont().getName().toLowerCase();
+                sp.bold = fontName.contains("bold") || fontName.contains("black");
+                sp.x = first.getXDirAdj();
+                sp.baseline = first.getYDirAdj();
+                sp.text = repl;
+                sp.font = first.getFont();
+                sp.line = line;
+                sp.from = at;
+                sp.to = at + find.length();
+                boolean startsLine = at == 0 && !hasNeighbourOnLeft(pageLines, line, sp.box);
+                Rectangle2D.Float lineBox = line.box(0, line.text.length());
+                boolean rightColumn = startsLine && lineBox.x + lineBox.width > pageWidth * 0.55f;
+                boolean endsLine = at + find.length() >= line.text.trim().length();
+                sp.right = endsLine && rightColumn;
+                spots.add(sp);
+                float newWidth = widthOf(sp, repl, style.size > 0 ? style.size : sp.size, style, false);
+                int tailStart = at + find.length();
+                while (tailStart < line.text.length() && Character.isWhitespace(line.text.charAt(tailStart))) {
+                    tailStart++;
+                }
+                float shift = newWidth - sp.box.width;
+                if (!repl.isEmpty() && Math.abs(shift) > 0.5f && !sp.right && tailStart < line.text.length()) {
+                    TextPosition head = line.tps.get(line.tpOfChar.get(tailStart));
+                    Spot tail = new Spot();
+                    tail.text = line.text.substring(tailStart);
+                    tail.box = line.box(tailStart, line.text.length());
+                    tail.size = head.getFontSizeInPt();
+                    String tailFont = head.getFont().getName() == null ? "" : head.getFont().getName().toLowerCase();
+                    tail.bold = tailFont.contains("bold") || tailFont.contains("black");
+                    tail.x = head.getXDirAdj() + (rightColumn ? 0 : shift);
+                    if (rightColumn) {
+                        sp.x -= shift;
+                    }
+                    tail.baseline = head.getYDirAdj();
+                    tail.fixedStyle = true;
+                    sp.tail = tail;
+                    tail.font = head.getFont();
+                    tail.line = line;
+                    tail.from = at + find.length();
+                    tail.to = line.text.length();
+                    trailing.add(tail);
+                }
             }
         }
-        if (boxes.isEmpty()) {
+        List<Spot> moved = trailing;
+        if (spots.isEmpty()) {
             return;
         }
-        boolean latin = true;
-        try {
-            new PDType1Font(Standard14Fonts.FontName.HELVETICA).getStringWidth(repl);
-        } catch (IllegalArgumentException e) {
-            latin = false;
+        BufferedImage shot = new PDFRenderer(doc).renderImageWithDPI(pageIndex, PageEraser.SAMPLE_DPI);
+        List<Spot> all = new ArrayList<>(spots);
+        all.addAll(moved);
+        List<Color[]> colours = new ArrayList<>();
+        for (Spot sp : all) {
+            sp.colours = PageEraser.sampleColours(shot, sp.box);
+            colours.add(sp.colours);
         }
-        if (!latin && !UnicodeFonts.face(repl, false).missing(repl).isEmpty()) {
-            result.skipped += boxes.size();
-            return;
+        java.util.Set<Long> targets = new java.util.HashSet<>();
+        for (Spot sp : all) {
+            sp.line.collectGlyphs(sp.from, sp.to, targets);
         }
-        final boolean useHelvetica = latin;
+        GlyphStripper.strip(doc, page, targets);
         PDRectangle crop = page.getCropBox();
+        int matches = spots.size();
+        List<Annotation> tailItems = new ArrayList<>();
         try (PDPageContentStream cs = new PDPageContentStream(
                 doc, page, PDPageContentStream.AppendMode.APPEND, true, true)) {
-            for (int i = 0; i < boxes.size(); i++) {
-                Rectangle2D.Float b = boxes.get(i);
-                float pdfBottom = crop.getUpperRightY() - (b.y + b.height);
-                cs.setNonStrokingColor(Color.WHITE);
-                cs.addRect(crop.getLowerLeftX() + b.x - 1, pdfBottom, b.width + 2, b.height);
+            for (int i = 0; i < all.size(); i++) {
+                Rectangle2D.Float b = all.get(i).box;
+                cs.setNonStrokingColor(colours.get(i)[0]);
+                cs.addRect(crop.getLowerLeftX() + b.x - 1, crop.getUpperRightY() - (b.y + b.height), b.width + 2,
+                        b.height);
                 cs.fill();
-                cs.setNonStrokingColor(Color.BLACK);
-                PDFont overlayFont = useHelvetica
-                        ? new PDType1Font(bold.get(i)
-                                ? Standard14Fonts.FontName.HELVETICA_BOLD : Standard14Fonts.FontName.HELVETICA)
-                        : UnicodeFonts.pdf(doc, UnicodeFonts.face(repl, bold.get(i)));
-                float naturalWidth = overlayFont.getStringWidth(repl) / 1000f * sizes.get(i);
-                // Shrink (never grow) so the new text does not run into the neighbouring text.
-                float fitted = naturalWidth > b.width ? sizes.get(i) * b.width / naturalWidth : sizes.get(i);
-                cs.beginText();
-                cs.setFont(overlayFont, fitted);
-                cs.newLineAtOffset(crop.getLowerLeftX() + targets.get(i)[0], crop.getUpperRightY() - targets.get(i)[1]);
-                cs.showText(repl);
-                cs.endText();
+            }
+            for (int i = 0; i < matches; i++) {
+                Spot sp = all.get(i);
                 result.coveredAndOverwritten++;
+                // A match and its pushed-along tail share one text object, so later matching can follow the
+                // visual line across them but never across unrelated text.
+                boolean open = false;
+                open = place(sp, cs, crop, style, pageIndex, result.items, tailItems, open);
+                if (sp.tail != null && sp.tail.text != null && moved.contains(sp.tail)) {
+                    open = place(sp.tail, cs, crop, style, pageIndex, result.items, tailItems, open);
+                }
+                if (open) {
+                    cs.endText();
+                }
             }
         }
+        if (!tailItems.isEmpty()) {
+            AnnotationBaker.drawOnPage(doc, page, tailItems, new java.util.HashMap<>());
+        }
     }
 
-    private static String decode(PDFont font, byte[] bytes) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-        while (in.available() > 0) {
-            String u = font.toUnicode(font.readCode(in));
-            sb.append(u == null ? "�" : u);
+    /** Draws one spot in its original font inside the open text object, or queues it as an Arial item. */
+    private static boolean place(Spot sp, PDPageContentStream cs, PDRectangle crop, Style style, int pageIndex,
+            List<Annotation> movable, List<Annotation> tails, boolean open) throws IOException {
+        if (sp.text.isEmpty()) {
+            return open;
         }
-        return sb.toString();
+        float size = !sp.fixedStyle && style.size > 0 ? style.size : sp.size;
+        Color colour = !sp.fixedStyle && style.color != null ? style.color : sp.colours[1];
+        boolean right = !sp.fixedStyle && ("right".equals(style.align) || ("auto".equals(style.align) && sp.right));
+        boolean exact = canUseOriginalFont(sp, !sp.fixedStyle && style.movable, style);
+        float width = widthOf(sp, sp.text, size, style, exact);
+        float x = right ? sp.box.x + sp.box.width - width : sp.x;
+        if (exact) {
+            if (!open) {
+                cs.beginText();
+            }
+            cs.setNonStrokingColor(colour);
+            cs.setFont(sp.font, size);
+            cs.setTextMatrix(org.apache.pdfbox.util.Matrix.getTranslateInstance(
+                    crop.getLowerLeftX() + x, crop.getUpperRightY() - sp.baseline));
+            cs.showText(sp.text);
+            return true;
+        }
+        Annotation item = Annotation.text(pageIndex, x, 0, sp.text);
+        item.fontSize = size;
+        item.bold = !sp.fixedStyle && style.bold != null ? style.bold : sp.bold;
+        item.color = colour;
+        item.refreshTextBounds();
+        item.x = right ? sp.box.x + sp.box.width - item.w : sp.x;
+        item.y = sp.baseline - Annotation.BASELINE * item.fontSize;
+        (sp.fixedStyle ? tails : movable).add(item);
+        return open;
     }
 
-    private static int occurrences(String s, String find) {
-        int n = 0;
-        for (int at = s.indexOf(find); at >= 0; at = s.indexOf(find, at + find.length())) {
-            n++;
+    /** True when the text can be drawn in the font it replaces: the font has every glyph and nothing overrides it. */
+    private static boolean canUseOriginalFont(Spot sp, boolean movable, Style style) {
+        if (movable || sp.font == null || (!sp.fixedStyle && style.bold != null && style.bold != sp.bold)) {
+            return false;
         }
-        return n;
+        try {
+            sp.font.encode(sp.text);
+            sp.font.getStringWidth(sp.text);
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
     }
+
+    private static float widthOf(Spot sp, String text, float size, Style style, boolean knownExact) {
+        if (text.isEmpty()) {
+            return 0;
+        }
+        Spot probe = new Spot();
+        probe.font = sp.font;
+        probe.text = text;
+        probe.fixedStyle = sp.fixedStyle;
+        probe.bold = sp.bold;
+        if (knownExact || canUseOriginalFont(probe, !sp.fixedStyle && style.movable, style)) {
+            try {
+                return sp.font.getStringWidth(text) / 1000f * size;
+            } catch (IOException | RuntimeException e) {
+                // fall through to the Arial measure
+            }
+        }
+        return textWidth(text, size, !sp.fixedStyle && style.bold != null ? style.bold : sp.bold);
+    }
+
+    private static float textWidth(String text, float size, boolean bold) {
+        Annotation probe = Annotation.text(0, 0, 0, text);
+        probe.fontSize = size;
+        probe.bold = bold;
+        probe.refreshTextBounds();
+        return probe.w;
+    }
+
+    /** True if other text (a currency symbol, a label) ends just before the box on the same baseline. */
+    private static boolean hasNeighbourOnLeft(List<Line> all, Line own, Rectangle2D.Float box) {
+        for (Line other : all) {
+            if (other == own) {
+                continue;
+            }
+            Rectangle2D.Float ob = other.box(0, other.text.length());
+            float size = box.height;
+            boolean sameRow = Math.abs((ob.y + ob.height) - (box.y + box.height)) < size * 0.5f;
+            float gap = box.x - (ob.x + ob.width);
+            if (sameRow && gap > -1f && gap < size * 1.5f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 }

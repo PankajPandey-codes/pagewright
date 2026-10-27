@@ -37,7 +37,7 @@ final class AnnotationBaker {
         }
     }
 
-    private static void drawOnPage(PDDocument doc, PDPage page, List<Annotation> items,
+    static void drawOnPage(PDDocument doc, PDPage page, List<Annotation> items,
                                    Map<File, PDType0Font> fonts) throws IOException {
         if (page.getRotation() != 0) {
             throw new IOException("Annotations on rotated pages are not supported");

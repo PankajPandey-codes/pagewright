@@ -104,6 +104,10 @@ final class PreviewPanel extends JPanel {
         this.interactive = interactive;
     }
 
+    Rectangle getHighlight() {
+        return highlight;
+    }
+
     void setHighlight(Rectangle r) {
         this.highlight = r;
         repaint();
