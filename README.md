@@ -44,7 +44,7 @@ so users need nothing installed. These builds are not code-signed, so macOS and 
 
 ```sh
 packaging/build-mac.sh          # -> dist/Pagewright.app (bundles its own Java runtime)
-packaging/build-mac.sh dmg      # -> dist/Pagewright-1.0.0.dmg
+packaging/build-mac.sh dmg      # -> dist/Pagewright-1.1.0.dmg
 packaging/make-launcher.sh      # rebuilds the "Start Pagewright" launcher from packaging/launcher.applescript
 ```
 

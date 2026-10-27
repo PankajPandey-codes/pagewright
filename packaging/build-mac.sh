@@ -25,7 +25,7 @@ fi
 "$JAVA_HOME/bin/jpackage" \
   --type "$TYPE" \
   --name "$APP_NAME" \
-  --app-version 1.0.0 \
+  --app-version 1.1.0 \
   --input target/input \
   --main-jar pagewright.jar \
   --main-class pagewright.App \
