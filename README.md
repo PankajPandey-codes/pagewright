@@ -71,3 +71,7 @@ packaging/make-launcher.sh      # rebuilds the "Start Pagewright" launcher from 
   in the file.
 - Scanned pages (images of text) cannot be edited as text.
 - Items can't be added to a rotated page yet.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
