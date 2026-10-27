@@ -24,7 +24,7 @@ opens it straight away.
 **Terminal (macOS and Linux):**
 
 ```sh
-git clone <this repo>
+git clone https://github.com/PankajPandey-codes/pagewright
 cd pagewright
 ./run.sh                 # sets itself up on first run, then opens the app
 ./run.sh some-file.pdf   # open a file straight away
